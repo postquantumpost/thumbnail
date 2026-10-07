@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+set -x
+
+go run . samples/2026100517283095_ghost_85.txt

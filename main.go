@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -101,7 +102,7 @@ func process(arg string) error {
 	}
 	add(0)
 	for _, t := range chapters {
-		add(t)
+		add(max(t+offset, 0))
 	}
 
 	for _, t := range times {
@@ -127,13 +128,22 @@ func process(arg string) error {
 	return nil
 }
 
+// offset in seconds added to each chapter timestamp.
+var offset int
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s file.mp4|file.txt ...\n", os.Args[0])
+	flag.IntVar(&offset, "offset", 0, "seconds added to each chapter timestamp")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s [-offset secs] file.mp4|file.txt ...\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if flag.NArg() < 1 {
+		flag.Usage()
 		os.Exit(2)
 	}
 	rc := 0
-	for _, a := range os.Args[1:] {
+	for _, a := range flag.Args() {
 		if err := process(a); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", a, err)
 			rc = 1

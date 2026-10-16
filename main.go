@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,13 +30,28 @@ func parseHMS(s string) (int, error) {
 	return total, nil
 }
 
-func readChapters(path string) ([]int, error) {
+// stamp is a chapter time: whole seconds plus a frame remainder within that second.
+type stamp struct{ sec, frame int }
+
+// parseFrame parses the "(:N)" frame remainder field.
+func parseFrame(s string) (int, error) {
+	if !strings.HasPrefix(s, "(:") || !strings.HasSuffix(s, ")") {
+		return 0, fmt.Errorf("bad frame field %q", s)
+	}
+	n, err := strconv.Atoi(s[2 : len(s)-1])
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("bad frame field %q", s)
+	}
+	return n, nil
+}
+
+func readChapters(path string) ([]stamp, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	var out []int
+	var out []stamp
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
@@ -47,22 +63,60 @@ func readChapters(path string) ([]int, error) {
 			fmt.Fprintf(os.Stderr, "%s: skipping line %q: %v\n", path, sc.Text(), err)
 			continue
 		}
-		out = append(out, t)
+		frame := 0
+		if len(fields) > 1 && strings.HasPrefix(fields[1], "(") {
+			frame, err = parseFrame(fields[1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: skipping line %q: %v\n", path, sc.Text(), err)
+				continue
+			}
+		}
+		out = append(out, stamp{t, frame})
 	}
 	return out, sc.Err()
 }
 
-func duration(video string) (float64, error) {
-	b, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
-		"-of", "default=nw=1:nk=1", video).Output()
+// lastStamp returns the seconds and frame remainder of the video's final frame.
+func lastStamp(video string) (stamp, error) {
+	b, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=r_frame_rate", "-of", "default=nw=1:nk=1", video).Output()
 	if err != nil {
-		return 0, err
+		return stamp{}, err
 	}
-	return strconv.ParseFloat(strings.TrimSpace(string(b)), 64)
+	num, den, ok := strings.Cut(strings.TrimSpace(string(b)), "/")
+	n, err1 := strconv.ParseFloat(num, 64)
+	d := 1.0
+	var err2 error
+	if ok {
+		d, err2 = strconv.ParseFloat(den, 64)
+	}
+	if err1 != nil || err2 != nil || n <= 0 || d <= 0 {
+		return stamp{}, fmt.Errorf("bad frame rate %q", strings.TrimSpace(string(b)))
+	}
+	fps := n / d
+
+	b, err = exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "packet=pts_time", "-of", "csv=p=0", video).Output()
+	if err != nil {
+		return stamp{}, err
+	}
+	last := -1.0
+	for _, l := range strings.Fields(string(b)) {
+		if v, err := strconv.ParseFloat(strings.TrimRight(l, ","), 64); err == nil && v > last {
+			last = v
+		}
+	}
+	if last < 0 {
+		return stamp{}, fmt.Errorf("no video packets")
+	}
+	sec := int(last)
+	frame := int(math.Round(last*fps)) - int(math.Ceil(float64(sec)*fps-1e-6))
+	return stamp{sec, max(frame, 0)}, nil
 }
 
-func hmsName(base string, sec int) string {
-	return fmt.Sprintf("%s_%02d_%02d_%02d.png", base, sec/3600, sec/60%60, sec%60)
+func hmsName(base string, s stamp) string {
+	sec := s.sec
+	return fmt.Sprintf("%s_%02d_%02d_%02d_%02d.png", base, sec/3600, sec/60%60, sec%60, s.frame)
 }
 
 func run(args ...string) error {
@@ -85,41 +139,47 @@ func process(arg string) error {
 	if err != nil {
 		return err
 	}
-	dur, err := duration(video)
+	last, err := lastStamp(video)
 	if err != nil {
 		return fmt.Errorf("ffprobe: %w", err)
 	}
-	lastSec := int(dur)
+	lastSec := last.sec
 
 	base := stem
-	seen := map[int]bool{}
-	var times []int
-	add := func(t int) {
+	seen := map[stamp]bool{}
+	var times []stamp
+	add := func(t stamp) {
 		if !seen[t] {
 			seen[t] = true
 			times = append(times, t)
 		}
 	}
-	add(0)
+	add(stamp{})
 	for _, t := range chapters {
-		add(max(t+offset, 0))
+		add(stamp{max(t.sec+offset, 0), t.frame})
 	}
 
 	for _, t := range times {
-		if t > lastSec {
-			fmt.Fprintf(os.Stderr, "%s: timestamp %d s beyond video end, skipping\n", video, t)
+		if t.sec > lastSec {
+			fmt.Fprintf(os.Stderr, "%s: timestamp %d s beyond video end, skipping\n", video, t.sec)
 			continue
 		}
 		out := hmsName(base, t)
-		if err := run("-ss", strconv.Itoa(t), "-i", video, "-frames:v", "1", out); err != nil {
+		args := []string{"-ss", strconv.Itoa(t.sec), "-i", video}
+		if t.frame > 0 {
+			// After an accurate seek, frame n=0 is the first frame of the second.
+			args = append(args, "-vf", fmt.Sprintf("select=eq(n\\,%d)", t.frame))
+		}
+		args = append(args, "-frames:v", "1", out)
+		if err := run(args...); err != nil {
 			return err
 		}
 		fmt.Println(out)
 	}
 
 	// Seek back from the end and keep overwriting one image so the final frame remains.
-	out := hmsName(base, lastSec)
-	if !seen[lastSec] {
+	out := hmsName(base, last)
+	if !seen[last] {
 		if err := run("-sseof", "-3", "-i", video, "-update", "1", "-q:v", "1", out); err != nil {
 			return err
 		}

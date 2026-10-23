@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+
+	vid "pygorvid/vid"
 )
 
 // parseHMS parses "[[h:]m:]s" into seconds.
@@ -33,16 +35,58 @@ func parseHMS(s string) (int, error) {
 // stamp is a chapter time: whole seconds plus a frame remainder within that second.
 type stamp struct{ sec, frame int }
 
-// parseFrame parses the "(:N)" frame remainder field.
+const superscriptDigits = "⁰¹²³⁴⁵⁶⁷⁸⁹"
+
+var frameDigits = strings.NewReplacer(
+	"⁰", "0", "¹", "1", "²", "2", "³", "3", "⁴", "4",
+	"⁵", "5", "⁶", "6", "⁷", "7", "⁸", "8", "⁹", "9",
+)
+
+// parseFrame parses a superscript or legacy "(:N)" frame remainder.
 func parseFrame(s string) (int, error) {
-	if !strings.HasPrefix(s, "(:") || !strings.HasSuffix(s, ")") {
-		return 0, fmt.Errorf("bad frame field %q", s)
+	digits := frameDigits.Replace(s)
+	if strings.HasPrefix(s, "(:") && strings.HasSuffix(s, ")") {
+		digits = s[2 : len(s)-1]
 	}
-	n, err := strconv.Atoi(s[2 : len(s)-1])
+	n, err := strconv.Atoi(digits)
 	if err != nil || n < 0 {
 		return 0, fmt.Errorf("bad frame field %q", s)
 	}
 	return n, nil
+}
+
+func parseChapter(line string) (stamp, error) {
+	fields := strings.Fields(line)
+	if start := strings.IndexAny(line, superscriptDigits); start >= 0 {
+		fields = strings.Fields(line[:start])
+		if len(fields) == 0 {
+			return stamp{}, fmt.Errorf("missing timestamp before frame number")
+		}
+		digits := line[start:]
+		if end := strings.IndexFunc(digits, func(r rune) bool {
+			return !strings.ContainsRune(superscriptDigits, r)
+		}); end >= 0 {
+			digits = digits[:end]
+		}
+		sec, err := parseHMS(fields[len(fields)-1])
+		if err != nil {
+			return stamp{}, err
+		}
+		frame, err := parseFrame(digits)
+		return stamp{sec, frame}, err
+	}
+	if len(fields) == 0 {
+		return stamp{}, fmt.Errorf("missing timestamp")
+	}
+	sec, err := parseHMS(fields[0])
+	if err != nil {
+		return stamp{}, err
+	}
+	frame := 0
+	if len(fields) > 1 && strings.HasPrefix(fields[1], "(") {
+		frame, err = parseFrame(fields[1])
+	}
+	return stamp{sec, frame}, err
 }
 
 func readChapters(path string) ([]stamp, error) {
@@ -54,64 +98,60 @@ func readChapters(path string) ([]stamp, error) {
 	var out []stamp
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) == 0 {
+		if strings.TrimSpace(sc.Text()) == "" {
 			continue
 		}
-		t, err := parseHMS(fields[0])
+		t, err := parseChapter(sc.Text())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: skipping line %q: %v\n", path, sc.Text(), err)
 			continue
 		}
-		frame := 0
-		if len(fields) > 1 && strings.HasPrefix(fields[1], "(") {
-			frame, err = parseFrame(fields[1])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s: skipping line %q: %v\n", path, sc.Text(), err)
-				continue
-			}
-		}
-		out = append(out, stamp{t, frame})
+		out = append(out, t)
 	}
 	return out, sc.Err()
 }
 
-// lastStamp returns the seconds and frame remainder of the video's final frame.
-func lastStamp(video string) (stamp, error) {
-	b, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
-		"-show_entries", "stream=r_frame_rate", "-of", "default=nw=1:nk=1", video).Output()
-	if err != nil {
-		return stamp{}, err
-	}
-	num, den, ok := strings.Cut(strings.TrimSpace(string(b)), "/")
-	n, err1 := strconv.ParseFloat(num, 64)
-	d := 1.0
-	var err2 error
-	if ok {
-		d, err2 = strconv.ParseFloat(den, 64)
-	}
-	if err1 != nil || err2 != nil || n <= 0 || d <= 0 {
-		return stamp{}, fmt.Errorf("bad frame rate %q", strings.TrimSpace(string(b)))
-	}
-	fps := n / d
+type videoFrame struct {
+	index uint64
+	pts   int64
+}
 
-	b, err = exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
-		"-show_entries", "packet=pts_time", "-of", "csv=p=0", video).Output()
-	if err != nil {
-		return stamp{}, err
-	}
-	last := -1.0
-	for _, l := range strings.Fields(string(b)) {
-		if v, err := strconv.ParseFloat(strings.TrimRight(l, ","), 64); err == nil && v > last {
-			last = v
+func readVideoFrames(reader *vid.VideoSampleReader) ([]videoFrame, error) {
+	frames := make([]videoFrame, 0, reader.SampleCount())
+	for index := 0; index < reader.SampleCount(); index++ {
+		sample, err := reader.SampleAt(uint64(index))
+		if err != nil {
+			return nil, err
 		}
+		frames = append(frames, videoFrame{pts: sample.PTSTicks})
 	}
-	if last < 0 {
-		return stamp{}, fmt.Errorf("no video packets")
+	sort.SliceStable(frames, func(i, j int) bool { return frames[i].pts < frames[j].pts })
+	for index := range frames {
+		frames[index].index = uint64(index)
 	}
+	if len(frames) == 0 {
+		return nil, fmt.Errorf("no video frames")
+	}
+	return frames, nil
+}
+
+// lastStamp returns the seconds and frame remainder of the video's final frame.
+func lastStamp(frames []videoFrame, timescale uint32, fps float64) stamp {
+	last := float64(frames[len(frames)-1].pts) / float64(timescale)
 	sec := int(last)
 	frame := int(math.Round(last*fps)) - int(math.Ceil(float64(sec)*fps-1e-6))
-	return stamp{sec, max(frame, 0)}, nil
+	return stamp{sec, max(frame, 0)}
+}
+
+func frameAtOrAfter(frames []videoFrame, seconds float64, timescale uint32) (uint64, bool) {
+	ticks := seconds * float64(timescale)
+	index := sort.Search(len(frames), func(i int) bool {
+		return float64(frames[i].pts) >= ticks-1e-6
+	})
+	if index == len(frames) {
+		return 0, false
+	}
+	return frames[index].index, true
 }
 
 func hmsName(base string, s stamp) string {
@@ -119,10 +159,24 @@ func hmsName(base string, s stamp) string {
 	return fmt.Sprintf("%s_%02d_%02d_%02d_%02d.png", base, sec/3600, sec/60%60, sec%60, s.frame)
 }
 
-func run(args ...string) error {
-	cmd := exec.Command("ffmpeg", append([]string{"-v", "error", "-y"}, args...)...)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+func saveFrame(decoder *vid.H264Decoder, index uint64, output string) error {
+	frame, err := decoder.DecodeFrame(index)
+	if err != nil {
+		return fmt.Errorf("decode frame %d: %w", index, err)
+	}
+	pixels, err := frame.ConvertToRGB(vid.ColorRangeLimited)
+	if err != nil {
+		return err
+	}
+	file, err := os.Create(output)
+	if err != nil {
+		return err
+	}
+	if err := vid.NewPNGEncoder().Write(file, pixels); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func process(arg string) error {
@@ -139,11 +193,39 @@ func process(arg string) error {
 	if err != nil {
 		return err
 	}
-	last, err := lastStamp(video)
-	if err != nil {
-		return fmt.Errorf("ffprobe: %w", err)
+	metadata := vid.NewMp4File()
+	if !metadata.Open(video) {
+		return fmt.Errorf("pygorvid: %s", metadata.ErrorInfo())
 	}
+	info := metadata.GetBasicInfo()
+	metadataError := metadata.ErrorInfo()
+	metadata.Close()
+	if metadataError != "" {
+		return fmt.Errorf("pygorvid: %s", metadataError)
+	}
+	if !info.HasVideo || len(info.VideoStreams) == 0 {
+		return fmt.Errorf("pygorvid: no video stream")
+	}
+	stream := info.VideoStreams[0]
+	if stream.FrameRate <= 0 {
+		return fmt.Errorf("pygorvid: invalid video frame rate %g", stream.FrameRate)
+	}
+	reader, err := vid.OpenVideoSampleReader(video)
+	if err != nil {
+		return fmt.Errorf("pygorvid: %w", err)
+	}
+	defer reader.Close()
+	frames, err := readVideoFrames(reader)
+	if err != nil {
+		return fmt.Errorf("pygorvid: %w", err)
+	}
+	timescale := reader.Configuration().Timescale
+	if timescale == 0 {
+		return fmt.Errorf("pygorvid: invalid video timescale")
+	}
+	last := lastStamp(frames, timescale, stream.FrameRate)
 	lastSec := last.sec
+	decoder := vid.NewH264Decoder(reader)
 
 	base := stem
 	seen := map[stamp]bool{}
@@ -165,22 +247,21 @@ func process(arg string) error {
 			continue
 		}
 		out := hmsName(base, t)
-		args := []string{"-ss", strconv.Itoa(t.sec), "-i", video}
-		if t.frame > 0 {
-			// After an accurate seek, frame n=0 is the first frame of the second.
-			args = append(args, "-vf", fmt.Sprintf("select=eq(n\\,%d)", t.frame))
+		index, ok := frameAtOrAfter(frames, float64(t.sec)+float64(t.frame)/stream.FrameRate, timescale)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "%s: timestamp %d s beyond video end, skipping\n", video, t.sec)
+			continue
 		}
-		args = append(args, "-frames:v", "1", out)
-		if err := run(args...); err != nil {
+		if err := saveFrame(decoder, index, out); err != nil {
 			return err
 		}
 		fmt.Println(out)
 	}
 
-	// Seek back from the end and keep overwriting one image so the final frame remains.
+	// Keep the final frame as a candidate thumbnail.
 	out := hmsName(base, last)
 	if !seen[last] {
-		if err := run("-sseof", "-3", "-i", video, "-update", "1", "-q:v", "1", out); err != nil {
+		if err := saveFrame(decoder, frames[len(frames)-1].index, out); err != nil {
 			return err
 		}
 		fmt.Println(out)

@@ -17,8 +17,12 @@ func TestParseChapter(t *testing.T) {
 		{"zero frame", "Chapter 2:03 ⁰", stamp{123, 0}},
 		{"adjacent frame", "Chapter 0:06³⁶", stamp{6, 36}},
 		{"multiple groups", "Chapter 0:06 ³⁶ ⁹⁹", stamp{6, 36}},
+		{"timestamp at start", "0:06 Three Sisters ³⁶ ᵖˡᵃᶜᵉ²", stamp{6, 36}},
+		{"Armenian separator at start", "0։06 Three Sisters ³⁶ ᵖˡᵃᶜᵉ²", stamp{6, 36}},
+		{"Armenian separator title first", "Three Sisters 0։06 ³⁶ ᵖˡᵃᶜᵉ²", stamp{6, 36}},
 		{"legacy frame", "0:06 (:36) Three Sisters", stamp{6, 36}},
 		{"legacy timestamp", "0:06 Three Sisters", stamp{6, 0}},
+		{"legacy Armenian separator", "0։06 Three Sisters", stamp{6, 0}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

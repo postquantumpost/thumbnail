@@ -18,7 +18,7 @@ import (
 // parseHMS parses "[[h:]m:]s" into seconds.
 func parseHMS(s string) (int, error) {
 	total := 0
-	parts := strings.Split(s, ":")
+	parts := strings.Split(strings.ReplaceAll(s, "։", ":"), ":")
 	if len(parts) > 3 {
 		return 0, fmt.Errorf("bad timestamp %q", s)
 	}
@@ -68,9 +68,12 @@ func parseChapter(line string) (stamp, error) {
 		}); end >= 0 {
 			digits = digits[:end]
 		}
-		sec, err := parseHMS(fields[len(fields)-1])
+		sec, err := parseHMS(fields[0])
 		if err != nil {
-			return stamp{}, err
+			sec, err = parseHMS(fields[len(fields)-1])
+			if err != nil {
+				return stamp{}, err
+			}
 		}
 		frame, err := parseFrame(digits)
 		return stamp{sec, frame}, err

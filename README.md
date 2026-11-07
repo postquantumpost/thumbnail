@@ -14,3 +14,8 @@ accepted as timestamp separators. Later annotation digits are ignored. Older
 title-first lines with the timestamp immediately before the frame remainder,
 and legacy lines beginning with a timestamp and an optional `(:N)` frame
 remainder, are also supported.
+
+Run `thumbnail [--offset secs] [--output dir] file.mp4|file.txt ...` to extract
+the candidate images. By default, images are written alongside the input video.
+When `--output` is specified, images are written to that directory, which is
+created if it does not exist.

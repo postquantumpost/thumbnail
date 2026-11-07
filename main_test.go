@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -47,6 +48,16 @@ func TestParseChapterInvalid(t *testing.T) {
 				t.Fatalf("parseChapter(%q) = %v, want an error", line, got)
 			}
 		})
+	}
+}
+
+func TestOutputName(t *testing.T) {
+	stamp := stamp{sec: 6, frame: 36}
+	if got, want := outputName("video", stamp, ""), "video_00_00_06_36.png"; got != want {
+		t.Fatalf("outputName without directory = %q, want %q", got, want)
+	}
+	if got, want := outputName("/videos/video", stamp, "thumbnails"), filepath.Join("thumbnails", "video_00_00_06_36.png"); got != want {
+		t.Fatalf("outputName with directory = %q, want %q", got, want)
 	}
 }
 

@@ -162,6 +162,14 @@ func hmsName(base string, s stamp) string {
 	return fmt.Sprintf("%s_%02d_%02d_%02d_%02d.png", base, sec/3600, sec/60%60, sec%60, s.frame)
 }
 
+func outputName(base string, s stamp, outputDir string) string {
+	name := hmsName(base, s)
+	if outputDir == "" {
+		return name
+	}
+	return filepath.Join(outputDir, filepath.Base(name))
+}
+
 func saveFrame(decoder *vid.H264Decoder, index uint64, output string) error {
 	frame, err := decoder.DecodeFrame(index)
 	if err != nil {
@@ -182,7 +190,7 @@ func saveFrame(decoder *vid.H264Decoder, index uint64, output string) error {
 	return file.Close()
 }
 
-func process(arg string) error {
+func process(arg, outputDir string) error {
 	stem := strings.TrimSuffix(arg, filepath.Ext(arg))
 	chapterFile := stem + ".txt"
 	video := arg
@@ -249,7 +257,7 @@ func process(arg string) error {
 			fmt.Fprintf(os.Stderr, "%s: timestamp %d s beyond video end, skipping\n", video, t.sec)
 			continue
 		}
-		out := hmsName(base, t)
+		out := outputName(base, t, outputDir)
 		index, ok := frameAtOrAfter(frames, float64(t.sec)+float64(t.frame)/stream.FrameRate, timescale)
 		if !ok {
 			fmt.Fprintf(os.Stderr, "%s: timestamp %d s beyond video end, skipping\n", video, t.sec)
@@ -262,7 +270,7 @@ func process(arg string) error {
 	}
 
 	// Keep the final frame as a candidate thumbnail.
-	out := hmsName(base, last)
+	out := outputName(base, last, outputDir)
 	if !seen[last] {
 		if err := saveFrame(decoder, frames[len(frames)-1].index, out); err != nil {
 			return err
@@ -276,9 +284,11 @@ func process(arg string) error {
 var offset int
 
 func main() {
+	var outputDir string
 	flag.IntVar(&offset, "offset", 0, "seconds added to each chapter timestamp")
+	flag.StringVar(&outputDir, "output", "", "directory for output image files")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s [-offset secs] file.mp4|file.txt ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s [-offset secs] [--output dir] file.mp4|file.txt ...\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -286,9 +296,15 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if outputDir != "" {
+		if err := os.MkdirAll(outputDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: create output directory: %v\n", outputDir, err)
+			os.Exit(1)
+		}
+	}
 	rc := 0
 	for _, a := range flag.Args() {
-		if err := process(a); err != nil {
+		if err := process(a, outputDir); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", a, err)
 			rc = 1
 		}

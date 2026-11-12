@@ -2,4 +2,4 @@
 
 set -x
 
-time go run . $*
+time go run . --output stream/i/ $*

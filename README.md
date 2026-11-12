@@ -1,6 +1,8 @@
 # thumbnail
 Extract thumbnail candidates from video and chapter files.
 
+Much of this code was developed with AI tools including code generation.
+
 Chapter lines contain a timestamp (`[[h:]m:]s`) at the beginning, followed by
 the title and a superscript frame remainder, for example:
 
